@@ -1,0 +1,664 @@
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog, simpledialog
+import threading
+import speech_recognition as sr
+import pyttsx3
+import datetime
+import webbrowser
+import openai
+import os
+import json
+import requests
+from PIL import Image, ImageTk
+import urllib.request
+import io
+import pyaudio
+
+SETTINGS_FILE = "va_settings.json"
+COMMANDS_FILE = "va_custom_commands.json"
+BACKGROUND_IMAGE_URL = "https://images.pexels.com/photos/373543/pexels-photo-373543.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940"
+
+
+
+
+
+class CommandManager:
+    def __init__(self):
+        self.default_commands = {
+            "time": {"desc": "Tells the current time", "action": self._time},
+            "open browser": {"desc": "Open Google home page", "action": self._open_browser},
+            "open facebook": {"desc": "Open Facebook website", "action": self._open_facebook},
+            "open instagram": {"desc": "Open Instagram website", "action": self._open_instagram},
+            "play music": {"desc": "Play music files from selected folder", "action": self._play_music},
+            "shutdown": {"desc": "Shutdown the assistant", "action": self._shutdown},
+            "help": {"desc": "Show help message", "action": self._show_help},
+            "weather": {"desc": "Get weather for city, e.g. weather London", "action": self._weather}
+        }
+        self.custom_commands = {}
+        self.load_custom_commands()
+
+    def ask_openai(prompt):
+        try:
+            response = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=[{"role": "user", "content": prompt}]
+            )
+            return response['choices'][0]['message']['content']
+        except Exception as e:
+            return "There was an error connecting to OpenAI."
+
+    def load_custom_commands(self):
+        if os.path.exists(COMMANDS_FILE):
+            try:
+                with open(COMMANDS_FILE, "r") as f:
+                    self.custom_commands = json.load(f)
+            except Exception:
+                self.custom_commands = {}
+
+    def save_custom_commands(self):
+        with open(COMMANDS_FILE, "w") as f:
+            json.dump(self.custom_commands, f, indent=2)
+
+    def add_custom_command(self, phrase, response):
+        self.custom_commands[phrase.lower()] = response
+        self.save_custom_commands()
+
+    def remove_custom_command(self, phrase):
+        phrase = phrase.lower()
+        if phrase in self.custom_commands:
+            del self.custom_commands[phrase]
+            self.save_custom_commands()
+            return True
+        return False
+
+    def get_all_commands(self):
+        cmds = {}
+        cmds.update(self.default_commands)
+        for k, v in self.custom_commands.items():
+            if isinstance(v, str) and (v.startswith(('http://', 'https://', 'www.'))):
+                def make_url_opener(url):
+                    return lambda: (webbrowser.open(url), f"Opening {url}")[1]
+
+                cmds[k] = {
+                    "desc": f"Custom command: opens {v}",
+                    "action": make_url_opener(v)
+                }
+            else:
+
+                def make_response(resp):
+                    return lambda: resp
+
+                cmds[k] = {
+                    "desc": f"Custom response: {v}",
+                    "action": make_response(v)
+                }
+        return cmds
+
+    def _time(self, va, *args):
+        current_time = datetime.datetime.now().strftime("%I:%M %p")
+        return f"The current time is {current_time}"
+
+    def _open_browser(self, va, *args):
+        webbrowser.open("https://www.google.com")
+        return "Opening the web browser."
+
+    def _open_facebook(self, va, *args):
+        webbrowser.open("https://www.facebook.com")
+        return "Opening Facebook."
+
+    def _open_instagram(self, va, *args):
+        webbrowser.open("https://www.instagram.com")
+        return "Opening Instagram."
+
+    def _play_music(self, va, *args):
+        music_dir = va.ask_music_folder()
+        if not music_dir:
+            return "Music folder selection cancelled."
+        try:
+            songs = [f for f in os.listdir(music_dir) if f.endswith(('.mp3', '.wav', '.m4a'))]
+            if songs:
+                song_path = os.path.join(music_dir, songs[0])
+                os.startfile(song_path)
+                return f"Playing music: {songs[0]}"
+            else:
+                return "No music files found in the selected directory."
+        except Exception as e:
+            return f"Error playing music: {str(e)}"
+
+    def _shutdown(self, va, *args):
+        va.exit_requested = True
+        va.root.after(500, va.root.destroy)
+        return "Shutting down. Have a nice day!"
+
+    def _show_help(self, va, *args):
+        help_text = "Available commands:\n"
+        for cmd, info in self.get_all_commands().items():
+            help_text += f"- {cmd}: {info['desc']}\n"
+        return help_text
+
+    def _weather(self, va, *args):
+        parts = args
+        if not parts:
+            return "Please specify a city after 'weather'. For example: weather London"
+        city = " ".join(parts)
+
+        try:
+            geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={city}&count=1"
+            geo_resp = requests.get(geo_url, timeout=5)
+            geo_json = geo_resp.json()
+            if "results" not in geo_json or len(geo_json["results"]) == 0:
+                return f"City '{city}' not found."
+            lat = geo_json["results"][0]["latitude"]
+            lon = geo_json["results"][0]["longitude"]
+
+            weather_url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current_weather=true"
+            weather_resp = requests.get(weather_url, timeout=5)
+            weather_json = weather_resp.json()
+            cw = weather_json.get("current_weather")
+            if not cw:
+                return f"Could not fetch weather for {city}."
+            temp_c = cw.get("temperature")
+            windspeed = cw.get("windspeed")
+            desc = f"Current temperature in {city} is {temp_c}°C with wind speed {windspeed} km/h."
+            return desc
+        except Exception as e:
+            return "Failed to fetch weather data."
+
+
+class VoiceAssistant:
+    def __init__(self, root):
+        self.root = root
+
+        # Full screen set ki he 
+        self.root.attributes('-fullscreen', True)
+        self.root.bind("<F11>", self.toggle_fullscreen)
+        self.root.bind("<Escape>", self.end_fullscreen)
+
+        self.root.title("Voice Assistant Pro")
+        self.root.configure(bg="#2c3e50")
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        self.engine = pyttsx3.init()
+        self.recognizer = sr.Recognizer()
+        self.listening = False
+        self.exit_requested = False
+        self.cmd_manager = CommandManager()
+        self.voice_index = 0
+        self.rate = 160
+        self.volume = 1.0
+        self.load_settings()
+        self.apply_voice_settings()
+        self.setup_background()
+        self.create_widgets()
+        threading.Thread(target=self.greet_user, daemon=True).start()
+
+    def toggle_fullscreen(self, event=None):
+        self.root.attributes('-fullscreen', not self.root.attributes('-fullscreen'))
+
+    def end_fullscreen(self, event=None):
+        self.root.attributes('-fullscreen', False)
+
+    def setup_background(self):
+        try:
+            url = BACKGROUND_IMAGE_URL
+            with urllib.request.urlopen(url) as u:
+                raw_data = u.read()
+            im = Image.open(io.BytesIO(raw_data))
+            im = im.resize((self.root.winfo_screenwidth(), self.root.winfo_screenheight()), Image.LANCZOS)
+            self.bg_image = ImageTk.PhotoImage(im)
+        except Exception:
+            self.bg_image = None
+
+        self.canvas = tk.Canvas(self.root, highlightthickness=0)
+        self.canvas.pack(fill=tk.BOTH, expand=True)
+        if self.bg_image:
+            self.canvas.create_image(0, 0, anchor=tk.NW, image=self.bg_image)
+        else:
+            self.canvas.configure(bg="#34495e")
+
+        self.frame_container = tk.Frame(self.canvas, bg="#000000", bd=0)
+        self.canvas.create_window((0, 0), window=self.frame_container, anchor=tk.NW,
+                                  width=self.root.winfo_screenwidth(),
+                                  height=self.root.winfo_screenheight())
+
+    def load_settings(self):
+        if os.path.exists(SETTINGS_FILE):
+            try:
+                with open(SETTINGS_FILE, "r") as f:
+                    s = json.load(f)
+                    self.voice_index = s.get("voice_index", 0)
+                    self.rate = s.get("rate", 160)
+                    self.volume = s.get("volume", 1.0)
+            except Exception:
+                pass
+
+    def save_settings(self):
+        s = {
+            "voice_index": self.voice_index,
+            "rate": self.rate,
+            "volume": self.volume
+        }
+        try:
+            with open(SETTINGS_FILE, "w") as f:
+                json.dump(s, f, indent=2)
+        except Exception:
+            pass
+
+    def apply_voice_settings(self):
+        voices = self.engine.getProperty('voices')
+        if 0 <= self.voice_index < len(voices):
+            self.engine.setProperty('voice', voices[self.voice_index].id)
+        self.engine.setProperty('rate', self.rate)
+        self.engine.setProperty('volume', self.volume)
+        self.voices = voices
+
+    def create_widgets(self):
+        # Title with logo
+        title_frame = tk.Frame(self.frame_container, bg="#1a1a1a", height=60)
+        title_frame.pack(fill=tk.X)
+
+        try:
+            img = Image.open("assistant_icon.png")
+            img = img.resize((40, 40), Image.LANCZOS)
+            self.logo_img = ImageTk.PhotoImage(img)
+            logo_label = tk.Label(title_frame, image=self.logo_img, bg="#1a1a1a")
+            logo_label.pack(side=tk.LEFT, padx=10, pady=10)
+        except Exception:
+            logo_label = tk.Label(title_frame, text="🤖", font=("Helvetica", 28), bg="#1a1a1a", fg="white")
+            logo_label.pack(side=tk.LEFT, padx=10)
+
+        title_label = tk.Label(title_frame, text="Voice Assistant Advanced Pro",
+                               font=("Helvetica", 18, "bold"), bg="#1a1a1a", fg="white")
+        title_label.pack(side=tk.LEFT, padx=5, pady=10)
+
+        self.status_frame = tk.Frame(self.frame_container, bg="#222222", bd=2, relief=tk.SUNKEN)
+        self.status_frame.pack(fill=tk.X, padx=20, pady=(15, 10))
+        self.status_label = tk.Label(self.status_frame, text="Ready",
+                                     font=("Helvetica", 12), bg="#222222", fg="white", anchor='w',
+                                     wraplength=560, justify=tk.LEFT)
+        self.status_label.pack(padx=10, pady=10, fill=tk.X)
+
+        sug_frame_wrap = tk.Frame(self.frame_container, bg="#2a2a2a")
+        sug_frame_wrap.pack(fill=tk.X, padx=20, pady=(5, 10))
+
+        sug_label = tk.Label(sug_frame_wrap, text="Try these commands or add your own:",
+                             font=("Helvetica", 12, "bold"),
+                             bg="#2a2a2a", fg="white")
+        sug_label.pack(anchor=tk.W)
+
+        canvas = tk.Canvas(sug_frame_wrap, height=60, bg="#333333", highlightthickness=0)
+        canvas.pack(fill=tk.X, side=tk.LEFT, expand=True)
+
+        scrollbar = ttk.Scrollbar(sug_frame_wrap, orient='horizontal', command=canvas.xview)
+        scrollbar.pack(fill=tk.X, side=tk.BOTTOM)
+
+        canvas.configure(xscrollcommand=scrollbar.set)
+
+        self.sug_btn_frame = tk.Frame(canvas, bg="#333333")
+        canvas.create_window((0, 0), window=self.sug_btn_frame, anchor='nw')
+
+        self.refresh_suggestions()
+
+        self.sug_btn_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+
+        input_frame = tk.Frame(self.frame_container, bg="#222222")
+        input_frame.pack(fill=tk.X, padx=20, pady=(0, 10))
+
+        self.cmd_entry = ttk.Entry(input_frame, font=("Helvetica", 12))
+        self.cmd_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, pady=5)
+        self.cmd_entry.bind("<Return>", lambda e: self.handle_text_command())
+
+        self.send_btn = ttk.Button(input_frame, text="Run", command=self.handle_text_command)
+        self.send_btn.pack(side=tk.LEFT, padx=5)
+
+        btn_frame = tk.Frame(self.frame_container, bg="#222222")
+        btn_frame.pack(fill=tk.X, padx=20, pady=(0, 10))
+
+        self.style = ttk.Style()
+        self.style.theme_use('clam')
+
+        self.style.configure('Accent.TButton',
+                             background='#2980b9',
+                             foreground='white',
+                             font=('Helvetica', 12, 'bold'),
+                             padding=8,
+                             borderwidth=0)
+        self.style.map('Accent.TButton',
+                       background=[('active', '#3498db')],
+                       foreground=[('active', 'white')])
+
+        self.listen_btn = ttk.Button(btn_frame, text="🎤 Speak Command",
+                                     command=self.start_listening,
+                                     style='Accent.TButton')
+        self.listen_btn.pack(side=tk.LEFT, padx=5, expand=True)
+
+        self.settings_btn = ttk.Button(btn_frame, text="⚙️ Settings",
+                                       command=self.open_settings,
+                                       style='Accent.TButton')
+        self.settings_btn.pack(side=tk.LEFT, padx=5, expand=True)
+
+        self.manage_cmd_btn = ttk.Button(btn_frame, text="📝 Manage Custom Commands",
+                                         command=self.open_manage_commands,
+                                         style='Accent.TButton')
+        self.manage_cmd_btn.pack(side=tk.LEFT, padx=5, expand=True)
+
+        self.clear_hist_btn = ttk.Button(btn_frame, text="🧹 Clear History",
+                                         command=self.clear_history,
+                                         style='Accent.TButton')
+        self.clear_hist_btn.pack(side=tk.LEFT, padx=5, expand=True)
+
+        self.clear_chat_btn = ttk.Button(btn_frame, text="🗑️ Clear Chat History",
+                                         command=self.clear_chat_history,
+                                         style='Accent.TButton')
+        self.clear_chat_btn.pack(side=tk.LEFT, padx=5, expand=True)
+
+        self.exit_btn = ttk.Button(btn_frame, text="Exit",
+                                   command=self.on_close,
+                                   style='Accent.TButton')
+        self.exit_btn.pack(side=tk.LEFT, padx=5, expand=True)
+
+        hist_frame = tk.Frame(self.frame_container, bg="#222222", bd=2, relief=tk.GROOVE)
+        hist_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=(0, 20))
+
+        hist_label = tk.Label(hist_frame, text="Command History:",
+                              font=("Helvetica", 12, "bold"), bg="#222222", fg="white")
+        hist_label.pack(anchor=tk.W, padx=10, pady=(10, 0))
+
+        self.history_text = tk.Text(hist_frame, height=12, font=("Helvetica", 10), state=tk.DISABLED,
+                                    bg="#111111", fg="#f1f1f1", wrap=tk.WORD, bd=0,
+                                    highlightthickness=0)
+        self.history_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+    def refresh_suggestions(self):
+        for widget in self.sug_btn_frame.winfo_children():
+            widget.destroy()
+        commands = self.cmd_manager.get_all_commands()
+        for cmd in commands:
+            btn = ttk.Button(self.sug_btn_frame, text=cmd, width=20,
+                             style='Accent.TButton',
+                             command=lambda c=cmd: self.handle_command(c))
+            btn.pack(side=tk.LEFT, padx=5, pady=10)
+
+    def update_status(self, text, color="#ecf0f1"):
+        self.status_label.config(text=text, fg=color)
+
+        def flash():
+            orig_bg = self.status_frame.cget("bg")
+            self.status_frame.config(bg="#27ae60")
+            self.root.after(300, lambda: self.status_frame.config(bg=orig_bg))
+
+        self.root.after(0, flash)
+
+    def update_history(self, text):
+        self.history_text.config(state=tk.NORMAL)
+        self.history_text.insert(tk.END, text + "\n")
+        self.history_text.see(tk.END)
+        self.history_text.config(state=tk.DISABLED)
+
+    def clear_chat_history(self):
+        if messagebox.askyesno("Clear Chat History", "Are you sure you want to clear the chat history?"):
+            self.history_text.config(state=tk.NORMAL)
+            self.history_text.delete(1.0, tk.END)
+            self.history_text.config(state=tk.DISABLED)
+            self.update_status("Chat history cleared.", "#27ae60")
+
+    def speak(self, text):
+        self.update_history(f"Assistant: {text}")
+        try:
+            self.engine.say(text)
+            self.engine.runAndWait()
+        except Exception as e:
+            self.update_status(f"Speech failed: {e}", "#c0392b")
+
+    def listen(self):
+        if self.listening or self.exit_requested:
+            return
+        self.listening = True
+        self.update_status("Listening... 🎙️", "#27ae60")
+        with sr.Microphone() as source:
+            self.recognizer.adjust_for_ambient_noise(source, duration=1)
+            try:
+                audio = self.recognizer.listen(source, timeout=10, phrase_time_limit=8)
+                command = self.recognizer.recognize_google(audio)
+                self.update_status(f"You said: {command}", "#2980b9")
+                self.update_history(f"You: {command}")
+                self.handle_command(command.lower())
+            except sr.UnknownValueError:
+                err_msg = "Sorry, I couldn't understand that. Please try again."
+                self.speak(err_msg)
+                self.update_status(err_msg, "#c0392b")
+            except sr.RequestError:
+                err_msg = "Sorry, speech recognition service is unavailable."
+                self.speak(err_msg)
+                self.update_status(err_msg, "#c0392b")
+            except Exception:
+                err_msg = "Listening timed out or error."
+                self.speak(err_msg)
+                self.update_status(err_msg, "#c0392b")
+        self.listening = False
+
+    def handle_command(self, command):
+        commands = self.cmd_manager.get_all_commands()
+
+        cmd_key = None
+        for c in commands:
+            if command == c:
+                cmd_key = c
+                break
+            if command.startswith(c + " "):
+                cmd_key = c
+                break
+        if cmd_key is None:
+            if command in self.cmd_manager.custom_commands:
+                response = self.cmd_manager.custom_commands[command]
+
+                if isinstance(response, str) and (response.startswith(('http://', 'https://', 'www.'))):
+                    webbrowser.open(response)
+                    self.speak(f"Opening {response}")
+                    self.update_status(f"Opening {response}")
+                else:
+                    self.speak(response)
+                    self.update_status(response)
+                return
+
+            self.speak("Sorry, I didn't understand that command. Please try again.")
+            self.update_status("Unknown command.", "#c0392b")
+            return
+
+        action = commands[cmd_key]["action"]
+        args = []
+        if command != cmd_key:
+            args = command[len(cmd_key):].strip().split()
+        try:
+            if callable(action):
+                if hasattr(action, "__call__"):
+                    if action.__code__.co_argcount > 1:
+                        result = action(self, *args)
+                    else:
+                        result = action()
+                else:
+                    result = action
+                if result is None:
+                    result = ""
+                if isinstance(result, str):
+                    self.speak(result)
+                    self.update_status(result)
+            else:
+                self.speak(str(action))
+                self.update_status(str(action))
+        except Exception as e:
+            self.speak("An error occurred while executing the command.")
+            self.update_status(f"Error: {str(e)}", "#c0392b")
+
+    def handle_text_command(self):
+        cmd = self.cmd_entry.get().strip()
+        if not cmd:
+            return
+        self.cmd_entry.delete(0, tk.END)
+        self.update_history(f"You: {cmd}")
+        threading.Thread(target=self.handle_command, args=(cmd.lower(),), daemon=True).start()
+
+    def start_listening(self):
+        if not self.listening:
+            threading.Thread(target=self.listen, daemon=True).start()
+
+    def clear_history(self):
+        if messagebox.askyesno("Clear History", "Are you sure you want to clear the command history?"):
+            self.history_text.config(state=tk.NORMAL)
+            self.history_text.delete(1.0, tk.END)
+            self.history_text.config(state=tk.DISABLED)
+            self.update_status("Command history cleared.", "#27ae60")
+
+    def greet_user(self):
+        hour = datetime.datetime.now().hour
+        if 0 <= hour < 12:
+            greet = "Good morning Rajkumar!"
+        elif 12 <= hour < 18:
+            greet = "Good afternoon Rajkumar!"
+        else:
+            greet = "Good evening Rajkumar!"
+        self.speak(greet)
+        self.speak("How can I assist you today?")
+        self.update_status(greet + " I'm ready to help.", "#27ae60")
+
+    def ask_music_folder(self):
+        folder = filedialog.askdirectory(title="Select Music Folder")
+        return folder
+
+    def open_settings(self):
+        settings_win = tk.Toplevel(self.root)
+        settings_win.title("Settings")
+        settings_win.geometry("360x320")
+        settings_win.resizable(False, False)
+        settings_win.configure(bg="#1a1a1a")
+        settings_win.grab_set()
+
+        lbl_fg = "white"
+        settings_win.option_add("*Foreground", lbl_fg)
+        settings_win.option_add("*Background", "#1a1a1a")
+        settings_win.option_add("*Entry.Background", "white")
+        settings_win.option_add("*Entry.Foreground", "black")
+
+        tk.Label(settings_win, text="Select Voice:", bg="#1a1a1a", fg=lbl_fg, font=("Helvetica", 12, "bold")).pack(
+            pady=(15, 5))
+        voice_var = tk.IntVar(value=self.voice_index)
+
+        voice_frame = tk.Frame(settings_win, bg="#1a1a1a")
+        voice_frame.pack(fill=tk.X)
+
+        for idx, voice in enumerate(self.voices):
+            ttk.Radiobutton(voice_frame, text=voice.name or voice.id, variable=voice_var, value=idx).pack(anchor=tk.W,
+                                                                                                          padx=15)
+
+        tk.Label(settings_win, text="Speech Rate:", bg="#1a1a1a", fg=lbl_fg, font=("Helvetica", 12, "bold")).pack(
+            pady=(20, 5))
+        rate_var = tk.IntVar(value=self.rate)
+        rate_scale = ttk.Scale(settings_win, from_=50, to=300, orient=tk.HORIZONTAL, variable=rate_var)
+        rate_scale.pack(fill=tk.X, padx=30)
+
+        tk.Label(settings_win, text="Volume:", bg="#1a1a1a", fg=lbl_fg, font=("Helvetica", 12, "bold")).pack(
+            pady=(20, 5))
+        volume_var = tk.DoubleVar(value=self.volume)
+        volume_scale = ttk.Scale(settings_win, from_=0, to=1, orient=tk.HORIZONTAL, variable=volume_var)
+        volume_scale.pack(fill=tk.X, padx=30)
+
+        def save_settings():
+            self.voice_index = voice_var.get()
+            self.rate = int(rate_var.get())
+            self.volume = volume_var.get()
+            self.apply_voice_settings()
+            self.save_settings()
+            messagebox.showinfo("Settings", "Settings saved successfully!")
+            settings_win.destroy()
+
+        save_btn = ttk.Button(settings_win, text="Save", command=save_settings)
+        save_btn.pack(pady=20)
+
+        settings_win.transient(self.root)
+        self.root.wait_window(settings_win)
+
+    def open_manage_commands(self):
+        mc_win = tk.Toplevel(self.root)
+        mc_win.title("Manage Custom Commands")
+        mc_win.geometry("500x400")
+        mc_win.configure(bg="#1a1a1a")
+        mc_win.grab_set()
+
+        lbl_fg = "white"
+
+        label = tk.Label(mc_win, text="Custom Commands", font=("Helvetica", 14, "bold"), bg="#1a1a1a", fg=lbl_fg)
+        label.pack(pady=10)
+
+        frame = tk.Frame(mc_win, bg="#1a1a1a")
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        scrollbar = tk.Scrollbar(frame)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.cmd_listbox = tk.Listbox(frame, yscrollcommand=scrollbar.set, font=("Helvetica", 11), selectmode=tk.SINGLE,
+                                      bg="#222222", fg="white", bd=0, highlightthickness=0)
+        self.cmd_listbox.pack(fill=tk.BOTH, expand=True)
+        scrollbar.config(command=self.cmd_listbox.yview)
+
+        for cmd, resp in self.cmd_manager.custom_commands.items():
+            display = f"{cmd} ➔ {resp}"
+            self.cmd_listbox.insert(tk.END, display)
+
+        add_btn = ttk.Button(mc_win, text="Add Command", command=self.add_custom_command_dialog)
+        add_btn.pack(side=tk.LEFT, padx=20, pady=10)
+
+        remove_btn = ttk.Button(mc_win, text="Remove Selected", command=self.remove_selected_command)
+        remove_btn.pack(side=tk.RIGHT, padx=20, pady=10)
+
+        def on_close():
+            self.refresh_suggestions()
+            mc_win.destroy()
+
+        mc_win.protocol("WM_DELETE_WINDOW", on_close)
+        mc_win.transient(self.root)
+        self.root.wait_window(mc_win)
+
+    def add_custom_command_dialog(self):
+        phrase = simpledialog.askstring("Add Command", "Enter command phrase (what you will say):", parent=self.root)
+        if not phrase:
+            return
+        response = simpledialog.askstring("Add Command Response", "Enter assistant's response for this command:",
+                                          parent=self.root)
+        if not response:
+            return
+        self.cmd_manager.add_custom_command(phrase.strip(), response.strip())
+        self.cmd_listbox.insert(tk.END, f"{phrase.strip()} ➔ {response.strip()}")
+
+    def remove_selected_command(self):
+        selected = self.cmd_listbox.curselection()
+        if not selected:
+            messagebox.showwarning("Remove Command", "Please select a command to remove.")
+            return
+        answer = messagebox.askyesno("Remove Command", "Are you sure you want to remove the selected command?")
+        if not answer:
+            return
+        index = selected[0]
+        item = self.cmd_listbox.get(index)
+        phrase = item.split("➔")[0].strip()
+        if self.cmd_manager.remove_custom_command(phrase):
+            self.cmd_listbox.delete(index)
+            messagebox.showinfo("Remove Command", f"Removed command: {phrase}")
+        else:
+            messagebox.showerror("Remove Command", f"Command not found: {phrase}")
+
+    def on_close(self):
+        if messagebox.askokcancel("Quit", "Are you sure you want to exit?"):
+            self.exit_requested = True
+            self.root.destroy()
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = VoiceAssistant(root)
+    root.mainloop()
+
+
+
+
+
+   
